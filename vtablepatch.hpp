@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -35,13 +36,26 @@
 #pragma pop_macro("NOMINMAX")
 #endif
 
-// FIXME
-#ifndef VTABLEPATCH_MSVC_LAYOUT
-#error TODO
-#endif
-
 namespace VTablePatch
 {
+	static void *AlignedAlloc(const std::size_t size, const std::size_t alignment)
+	{
+#ifdef VTABLEPATCH_MSVC_LAYOUT
+		return _aligned_alloc(size, alignment);
+#else
+		return std::aligned_alloc(alignment, size);
+#endif
+	}
+
+	static void AlignedFree(void* const ptr)
+	{
+#ifdef VTABLEPATCH_MSVC_LAYOUT
+		_aligned_free(ptr);
+#else
+		free(ptr);
+#endif
+	}
+
 	struct VTable
 	{
 		void *rttiCompleteObjectLocator;
@@ -60,15 +74,39 @@ namespace VTablePatch
 
 		static VTable *New(const std::size_t dataSize)
 		{
-			return reinterpret_cast<VTable *>(_aligned_malloc(sizeof(void *) + dataSize, alignof(VTable)));
+			return reinterpret_cast<VTable *>(AlignedAlloc(sizeof(void *) + dataSize, alignof(VTable)));
 		}
 
 		static void Delete(VTable *const ptr)
 		{
 			ptr->~VTable();
-			_aligned_free(ptr);
+			AlignedFree(ptr);
 		}
 	};
+
+	template<typename T>
+	struct FunctionPointerMapping
+	{
+		T Member;
+		T Target;
+	};
+
+	template<typename Ret, typename Class, typename... Args>
+	struct FunctionPointerMapping<Ret(Class::*)(Args...)>
+	{
+		using MemberPointerType = Ret(Class::*)(Args...);
+		using TargetPointerType = Ret(*)(Class *, Args...);
+		using ReturnType = Ret;
+		using ArgumentTypes = std::tuple<Args...>;
+
+		MemberPointerType Member;
+		TargetPointerType Target;
+
+		FunctionPointerMapping(MemberPointerType member, TargetPointerType target) : Member{member}, Target{target} {}
+	};
+
+	template<typename T> FunctionPointerMapping(T, T) -> FunctionPointerMapping<T>;
+	template<typename Ret, typename Class, typename...Args> FunctionPointerMapping(Ret(Class::*)(Args...), Ret(*)(Class *, Args...)) -> FunctionPointerMapping<Ret(Class::*)(Args...)>;
 
 	template<typename Class>
 	class PatchedClassBase
@@ -85,40 +123,15 @@ namespace VTablePatch
 		};
 
 	public:
-		template<typename T>
-		struct FunctionPointerMapping
-		{
-			T Member;
-			T Target;
-		};
-
-		template<typename Ret, typename... Args>
-		struct FunctionPointerMapping<Ret(Class::*)(Args...)>
-		{
-			using MemberPointerType = Ret(Class::*)(Args...);
-			using TargetPointerType = Ret(*)(Class *, Args...);
-			using ReturnType = Ret;
-			using ArgumentTypes = std::tuple<Args...>;
-
-			MemberPointerType Member;
-			TargetPointerType Target;
-
-			FunctionPointerMapping(MemberPointerType member, TargetPointerType target) : Member{member}, Target{target} {}
-		};
-
-		template<typename T> FunctionPointerMapping(T, T) -> FunctionPointerMapping<T>;
-		template<typename Ret, typename...Args> FunctionPointerMapping(Ret(Class::*)(Args...), Ret(*)(Class *, Args...)) -> FunctionPointerMapping<Ret(Class::*)(Args...)>;
-
-	public:
 		template<typename... Args> void PatchVTable(FunctionPointerMapping<Args>... args);
 
 	private:
 		void **GetVTable();
 		template<typename T> std::uintptr_t PointerToFunctionMemberToPointer(T pfm);
 		void ReplaceVTable(struct VTable *newVTable);
+		template<typename Ret, typename...Args> std::uintptr_t GetVTableIndexFromPointer(Ret(Class::*pointer)(Args...));
 
 #ifdef VTABLEPATCH_MSVC_LAYOUT
-		template<typename Ret, typename...Args> std::uintptr_t GetVTableIndexFromPointer(Ret(Class::*pointer)(Args...));
 		int ExceptionFilter(std::uintptr_t &location, int exceptionCode, LPEXCEPTION_POINTERS exceptionInformation);
 #endif
 
@@ -143,6 +156,7 @@ namespace VTablePatch
 		void **const oldVTable{GetVTable()};
 		void *const objectLocator{oldVTable[-1]};
 
+#ifdef VTABLEPATCH_MSVC_ABI
 		SYSTEM_INFO systemInfo;
 		GetSystemInfo(&systemInfo);
 
@@ -158,6 +172,7 @@ namespace VTablePatch
 		}
 
 		ReplaceVTable(pseudoVTable.get());
+#endif
 
 		std::map<std::uintptr_t, FunctionPointerMapping<std::uintptr_t>> newVTableMapping;
 
@@ -200,11 +215,11 @@ namespace VTablePatch
 		std::memcpy(std::launder(static_cast<Class *>(this)), &ptr, sizeof(newVTable));
 	}
 
-#ifdef VTABLEPATCH_MSVC_LAYOUT
 	template<typename Class>
 	template<typename Ret, typename...Args>
 	std::uintptr_t PatchedClassBase<Class>::GetVTableIndexFromPointer(Ret(Class::*pointer)(Args...))
 	{
+#ifdef VTABLEPATCH_MSVC_LAYOUT
 		auto location = static_cast<std::uintptr_t>(-1);
 
 		__try
@@ -221,8 +236,12 @@ namespace VTablePatch
 		}
 
 		return location;
+#else
+		return PointerToFunctionMemberToPointer(pointer) - 1;
+#endif
 	}
 
+#ifdef VTABLEPATCH_MSVC_LAYOUT
 	template<typename Class>
 	int PatchedClassBase<Class>::ExceptionFilter(std::uintptr_t &location, int exceptionCode, LPEXCEPTION_POINTERS exceptionInformation)
 	{

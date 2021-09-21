@@ -14,7 +14,7 @@ class TestClass : private VTablePatch::PatchedClassBase<TestClass>
 public:
 	TestClass()
 	{
-		PatchVTable(FunctionPointerMapping{&TestClass::GetTime, &TestClass::GetPatchedTime});
+		PatchVTable(VTablePatch::FunctionPointerMapping{&TestClass::GetTime, &TestClass::GetPatchedTime});
 	}
 
 public:
